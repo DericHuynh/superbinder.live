@@ -1,8 +1,8 @@
 const { Server } = require('socket.io');
 const fs = require('fs').promises;
 const path = require('path');
-
 const channels = new Map();
+const { v4: uuidv4 } = require('uuid');
 
 const entityConfigs = {
   goals: { idKey: 'id', requiredFields: ['id', 'text'], orderField: 'order', events: { add: 'add-goal', update: 'update-goal', remove: 'remove-goal', reorder: 'reorder-goals' } },
@@ -309,6 +309,7 @@ async function handleCrudOperation(channelName, userUuid, type, payload, socket)
     }
   }
 
+  console.log("Checking normalized payload:");
   const newState = updateFunc ? updateFunc(state, normalizedPayload, entityType) : state;
   if (newState !== undefined) {
     channel.state[entityType] = newState;
@@ -344,10 +345,90 @@ async function handleCrudOperation(channelName, userUuid, type, payload, socket)
   console.log(`Broadcasting ${type} to channel ${channelName}:`, broadcastData);
   broadcastToChannel(channelName, type, broadcastData, userUuid);
 
+  if(entityType === 'chat' && operation === 'add')
+  {
+    if(normalizedPayload.text.length > 0)
+    {
+        const isAt = normalizedPayload.text.charAt(0);
+        if(isAt === '@')
+        {
+          const nameWithAt = normalizedPayload.text.split(" ")[0];
+          const name = nameWithAt.substring(1, nameWithAt.length);
+          const agentState = channel.state['agents'];
+          const documentState = channel.state['documents'];
+          const goalsState = channel.state['goals'];
+          const agent = agentState.find(a => a['name'] === name);
+          if(agent)
+          {
+            var serverTimestamp = Date.now();
+            const agentUuid = "agent-" + agent["id"];
+            const uuid = uuidv4();
+            var context = '';
+            context = context + `Here's your description as an agent: ${agent['description']}`;
+            goalsState.forEach((goal) => {
+              context = context + ` Goal ${goal.text} `;
+            });
+            documentState.forEach(document => {
+              context = context + ` New document, document name is ${document.name} content is the following: ` + document['processedContent'];
+              console.log("Content: " + document['processedContent']);
+            });
+            broadcastToChannel(channelName, "draft-chat", { 
+              id: uuid, 
+              userUuid: agentUuid, 
+              color: '#657261',
+              text: "Drafting a response...", 
+              timestamp: Date.now()
+            }, agentUuid);
+            const response = await fetchCompletion(agent, context, normalizedPayload.text);
+            serverTimestamp = Date.now();
+            const payload = { 
+              id: uuid, 
+              userUuid: agentUuid, 
+              color: '#657261',
+              text: response, 
+              timestamp: serverTimestamp
+            }
+            updateCreateState(state, payload, entityType);
+            channel.state[entityType] = state;   
+            broadcastToChannel(channelName, 'add-chat', payload, agentUuid);
+          }
+        }
+    }
+  }
+
   if (shouldSave) {
     await saveStateToServer(channelName, entityType, channel.state[entityType]);
   }
 }
+
+const fetchCompletion = async (agent, context, message) => {
+  console.log(agent);
+  const agentName = agent["name"];
+  const apiKey = process.env.OPENAI_API_KEY;  // Replace with your OpenAI API key
+  const messages = [{role: "system", content: "Your name is " + agentName + "and here's the context:" + context}, {role: "user", content: message}];
+  const endpoint = "https://api.openai.com/v1/chat/completions";
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      messages,
+      model: "gpt-4o",
+      temperature: 0,
+    }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw Error(data.error.message);
+  }
+
+  return data.choices[0].message.content;
+};
+
 
 function createRealTimeServers(server, corsOptions) {
   const io = new Server(server, {
